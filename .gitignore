@@ -1,0 +1,9 @@
+.DS_Store
+.build/
+.swiftpm/
+.pio/
+.pio-tools/
+__pycache__/
+*.app/
+dist/
+.git.broken-backup

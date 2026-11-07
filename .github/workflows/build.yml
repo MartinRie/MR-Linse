@@ -1,0 +1,127 @@
+# Repository root: contents of the Lupe folder (including SoulearLupe/).
+# Current app uses macOS-only frameworks; Windows/Linux require a source port.
+name: Build MR-Linse
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mac:
+    name: macOS Apple Silicon
+    runs-on: macos-15
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Projekt finden
+        run: |
+          if [[ -f SoulearLupe/Package.swift ]]; then
+            echo 'PROJECT=SoulearLupe' >> "$GITHUB_ENV"
+          elif [[ -f Package.swift ]]; then
+            echo 'PROJECT=.' >> "$GITHUB_ENV"
+          else
+            echo '::error::Package.swift fehlt. Bitte den Quellcode mit hochladen.'
+            exit 1
+          fi
+          # Bundled esptool is arm64; do not silently build an incompatible app.
+          test "$(uname -m)" = arm64
+
+      - name: Release-Version pruefen
+        if: github.event_name == 'release'
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          VERSION="$(cat "$PROJECT/VERSION")"
+          if [[ "$RELEASE_TAG" != "v$VERSION" ]]; then
+            echo "::error::Release-Tag muss v$VERSION sein (siehe VERSION)."
+            exit 1
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: PlatformIO installieren
+        run: python -m pip install 'platformio==6.1.18'
+
+      - name: C3-Firmware bauen
+        run: python -m platformio run --project-dir "$PROJECT/C3-Bruecke"
+
+      - name: Update-Logik testen
+        run: |
+          swiftc "$PROJECT/Sources/SoulearLupe/UpdateRelease.swift" "$PROJECT/Tests/UpdateChecks.swift" -o "$RUNNER_TEMP/update-checks"
+          "$RUNNER_TEMP/update-checks"
+
+      - name: Mac-App bauen
+        run: |
+          chmod +x "$PROJECT/FlashResources/esptool"
+          zsh "$PROJECT/build_app.sh"
+          APP="$(cd "$PROJECT/.." && pwd)/MR-Linse.app"
+          test -x "$APP/Contents/MacOS/SoulearLupe"
+          for name in bootloader partitions firmware; do
+            cmp "$PROJECT/C3-Bruecke/.pio/build/supermini/$name.bin" "$APP/Contents/Resources/C3/$name.bin"
+          done
+          "$APP/Contents/Resources/C3/esptool" version
+          plutil -lint "$APP/Contents/Info.plist"
+          # Ad-hoc signing only: no Apple Developer certificate or notarization.
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict "$APP"
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent "$APP" dist/MR-Linse-macOS-arm64.zip
+
+      - name: Firmware als separaten Download packen
+        run: |
+          mkdir -p dist/C3-Firmware
+          cp "$PROJECT/C3-Bruecke/.pio/build/supermini/"{bootloader,partitions,firmware}.bin dist/C3-Firmware/
+          cp "$PROJECT/FlashResources/boot_app0.bin" dist/C3-Firmware/
+          cat > dist/C3-Firmware/LIESMICH.txt <<'TXT'
+          ESP32-C3 SuperMini / MR-Linse
+          Die Mac-App enthaelt diese Firmware bereits und kann sie installieren.
+          Manuelles Flashen mit esptool v4:
+          esptool --chip esp32c3 --port PORT --baud 460800 write_flash 0x0 bootloader.bin 0x8000 partitions.bin 0xe000 boot_app0.bin 0x10000 firmware.bin
+          Achtung: ersetzt die vorhandene Firmware auf dem ausgewaehlten Board.
+          TXT
+          (cd dist && zip -r MR-Linse-C3-Firmware.zip C3-Firmware)
+
+      - name: Bedienungsanleitung beilegen
+        run: |
+          cp Docs/MR-Linse-Bedienungsanleitung.pdf dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MR-Linse-macOS-arm64
+          path: |
+            dist/*.zip
+            dist/*.pdf
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Downloads an Release anhaengen
+    needs: mac
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: MR-Linse-macOS-arm64
+          path: dist
+      - name: Pakete hochladen
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$RELEASE_TAG" dist/*.zip dist/*.pdf --clobber
