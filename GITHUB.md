@@ -47,4 +47,11 @@ CI prueft den Build, die eingebetteten Firmwaredateien, den Start des Flash-Tool
 
 ## Versionen und Updatequelle
 
-`SoulearLupe/VERSION` enthält die App-Version. Release-Tags müssen exakt `v` plus diese Version sein (z. B. `v0.2.0`). Der Workflow prüft diese Übereinstimmung und trägt `GITHUB_REPOSITORY` als Updatequelle in die App ein. Die App prüft öffentliche stabile Releases und bietet nur das fertige Paket `MR-Linse-macOS-arm64.zip` an. Vorabversionen sind ausgeschlossen. Details zur Bedienung stehen in der README.
+`SoulearLupe/VERSION` enthält die App-Version. Release-Tags müssen exakt `v` plus diese Version sein (z. B. `v0.2.2`). Der Workflow prüft diese Übereinstimmung und trägt `GITHUB_REPOSITORY` als Updatequelle in die App ein. Die App prüft öffentliche stabile Releases und bietet nur das fertige Paket `MR-Linse-macOS-arm64.zip` an. Vorabversionen sind ausgeschlossen. Details zur Bedienung stehen in der README.
+
+## Veröffentlichung v0.2.2
+
+1. Den vorbereiteten Commit auf main pushen.
+2. Auf GitHub in SoulearLupe/VERSION prüfen: 0.2.2.
+3. Ein neues Release mit dem NEUEN Tag v0.2.2 auf main veröffentlichen.
+4. Den erfolgreichen Build abwarten. Alte fehlgeschlagene Releases müssen nicht erneut gestartet werden.

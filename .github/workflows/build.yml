@@ -44,7 +44,7 @@ jobs:
         run: |
           VERSION="$(cat "$PROJECT/VERSION")"
           if [[ "$RELEASE_TAG" != "v$VERSION" ]]; then
-            echo "::error::Release-Tag muss v$VERSION sein (siehe VERSION)."
+            echo "::error::Tag: $RELEASE_TAG; erwarteter Tag: v$VERSION; Commit: $GITHUB_SHA. VERSION committen und pushen, dann einen neuen Tag auf diesem Commit erstellen."
             exit 1
           fi
 
