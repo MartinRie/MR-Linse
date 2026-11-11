@@ -25,13 +25,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     private let activityDot = NSView()
     private var window: NSWindow!
     private let transport = CameraTransport()
-    private let lamp = NSPopUpButton()
+    private let lamp = NSSwitch()
+    private let lampStatus = NSTextField(labelWithString: "Nicht verbunden")
+    private var confirmedLamp: Bool?
+    private var lampQuerySent = false
+    private let preview = PreviewPipeline()
+    private var processingMS: Double = 0
+    private var lastStatistics = Date.distantPast
+    private var lastStatsFrames = 0
+    private var reconnect = ReconnectPolicy()
+    private var retryUSB = false
+    private var retryPort: String?
+    private var profiles = [CameraProfile.standard]
+    private var profileIndex = 0
+    private var profile: CameraProfile { profiles[profileIndex] }
+    private let profilePicker = NSPopUpButton()
+    private let profileButton = NSButton(title: "Profil bearbeiten …", target: nil, action: nil)
     private var lampID: UInt16 = 0
     private var awaitingLamp: UInt16?
     private let scaleLabel = NSTextField(labelWithString: "1×")
-    private let previewLock = NSLock()
-    private var pendingPreview: (jpeg: Data, roll: CGFloat?, inverted: Bool?)?
-    private var previewScheduled = false
     private let usb = BridgeReader()
     private let source = NSPopUpButton()
     private var preferredSource: String?
@@ -62,6 +74,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         buildWindow()
+        restoreSettings()
+        preview.deliver = { [weak self] frame, image, elapsed in
+            guard let self, self.live else { return }
+            self.processingMS = elapsed
+            if let inverted = frame.inverted { self.mountAngle = inverted ? .pi : 0 }
+            self.showFrame(frame.jpeg, image: NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height)), roll: frame.roll)
+        }
         updater.mayPresent = { [weak self] in
             guard let self else { return false }
             return !self.flashing && !self.checkingFirmware && self.window.attachedSheet == nil && NSApp.modalWindow == nil
@@ -80,24 +99,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
             DispatchQueue.main.async { self?.setStatus(message) }
         }
         transport.onFrame = { [weak self] jpeg, roll in
-            self?.enqueuePreview(jpeg, roll: roll, inverted: nil)
+            self?.preview.submit(jpeg, roll: roll, inverted: nil)
         }
         transport.onStopped = { [weak self] message in
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.live = false
+                self.preview.reset()
+                self.latestJPEG = nil
+                self.captureButton.isEnabled = false
                 self.resetFreeze()
-                self.awaitingLamp = nil
-                self.lamp.isEnabled = false
-                self.lamp.item(at: 0)?.title = "Kameralicht"
-                self.source.isEnabled = true
-                self.startButton.title = "Verbinden"
-                self.ipField.isEnabled = true
-                self.setStatus(message)
+                self.resetLamp()
+                if message.contains("Firmware aktualisieren") {
+                    self.reconnect.stop(); self.firmwareMatches = false; self.checkedPort = nil
+                    self.flashButton.isHidden = false
+                }
+                if self.reconnect.wanted { self.reconnect.failed() }
+                self.source.isEnabled = !self.reconnect.wanted
+                self.profilePicker.isEnabled = !self.reconnect.wanted
+                self.profileButton.isEnabled = !self.reconnect.wanted
+                self.startButton.isEnabled = true
+                self.startButton.title = self.reconnect.wanted ? "Verbindung beenden" : "Verbinden"
+                self.placeholder.stringValue = self.reconnect.wanted ? "Verbindung wird wiederhergestellt …" : "Noch kein Kamerabild"
+                self.placeholder.isHidden = false
+                self.frameLabel.stringValue = "Kein Livebild"
+                self.setStatus(message + (self.reconnect.wanted ? " Neuer Versuch folgt automatisch." : ""))
             }
         }
         usb.onFrame = { [weak self] jpeg, roll, inverted in
-            self?.enqueuePreview(jpeg, roll: roll, inverted: inverted)
+            self?.preview.submit(jpeg, roll: roll, inverted: inverted)
         }
         let reply: (Data) -> Void = { [weak self] packet in
             DispatchQueue.main.async { self?.receiveLampReply(packet) }
@@ -107,7 +137,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         usb.onStopped = transport.onStopped
         refreshSources()
         discover()
-        Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in self?.refreshSources(); self?.discover() }
+        Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.connectionTick() }
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -119,7 +149,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
                           styleMask: [.titled, .closable, .miniaturizable, .resizable],
                           backing: .buffered, defer: false)
         window.title = "MR-Linse"
-        window.minSize = NSSize(width: 780, height: 560)
+        window.minSize = NSSize(width: 780, height: 710)
         window.center()
         window.isReleasedWhenClosed = false
 
@@ -215,6 +245,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
             add(line)
             column.setCustomSpacing(15, after: line)
         }
+        section("Kamera")
+        profilePicker.target = self
+        profilePicker.action = #selector(profileChanged)
+        profilePicker.setAccessibilityLabel("Kameraprofil")
+        add(profilePicker)
+        profileButton.target = self
+        profileButton.action = #selector(editProfile)
+        profileButton.bezelStyle = .rounded
+        add(profileButton)
+        rule()
         section("Verbindung")
         source.target = self
         source.action = #selector(sourceChanged)
@@ -246,12 +286,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         ])
         orientation.distribution = .fillEqually
         add(orientation)
-        lamp.addItems(withTitles: ["Kameralicht", "Licht einschalten", "Licht ausschalten"])
         lamp.target = self
         lamp.action = #selector(setLamp)
         lamp.isEnabled = false
         lamp.setAccessibilityLabel("Kameralicht")
-        add(lamp)
+        let lightRow = NSStackView(views: [NSTextField(labelWithString: "Kameralicht"), spacer(), lamp])
+        add(lightRow)
+        lampStatus.font = .systemFont(ofSize: 11)
+        lampStatus.textColor = .secondaryLabelColor
+        add(lampStatus)
         rule()
         let device = NSStackView()
         let title = NSTextField(labelWithString: "Gerät")
@@ -345,31 +388,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         activityDot.layer?.backgroundColor = (live && frameCount > 0 ? NSColor.systemGreen : .systemGray).cgColor
     }
 
-    // Both receivers publish into one slot. A busy UI presents the freshest
-    // complete JPEG with its own orientation when it can draw again.
-    private func enqueuePreview(_ jpeg: Data, roll: CGFloat?, inverted: Bool?) {
-        previewLock.lock()
-        pendingPreview = (jpeg, roll, inverted)
-        let schedule = !previewScheduled
-        previewScheduled = true
-        previewLock.unlock()
-        guard schedule else { return }
-        DispatchQueue.main.async { [weak self] in self?.presentPendingPreview() }
-    }
-
-    private func presentPendingPreview() {
-        previewLock.lock()
-        let frame = pendingPreview
-        pendingPreview = nil
-        previewScheduled = false
-        previewLock.unlock()
-        guard live, !frozen, let frame else { return }
-        if let inverted = frame.inverted { mountAngle = inverted ? .pi : 0 }
-        showFrame(frame.jpeg, roll: frame.roll)
-    }
-
-    private func showFrame(_ jpeg: Data, roll: CGFloat?) {
-        guard let image = NSImage(data: jpeg) else { return }
+    private func showFrame(_ jpeg: Data, image: NSImage, roll: CGFloat?) {
         if let roll {
             let target = roll + mountAngle
             if let previous = sensorAngle {
@@ -384,11 +403,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         frameCount += 1
         imageView.image = image
         placeholder.isHidden = true
-        frameLabel.stringValue = "\(frameCount) Bilder · lokal"
+        reconnect.succeeded()
+        let elapsed = Date().timeIntervalSince(lastStatistics)
+        if elapsed >= 1 {
+            let received = preview.snapshot().received
+            let fps = lastStatistics == .distantPast ? 0 : Double(received - lastStatsFrames) / elapsed
+            frameLabel.stringValue = String(format: "%.0f fps · Verarbeitung %.0f ms", fps, processingMS)
+            frameLabel.toolTip = "Zeit vom vollständigen JPEG am Mac bis zur Übergabe an die Ansicht. Keine Messung der gesamten Kameraverzögerung. Verworfen für ein aktuelleres Bild: \(preview.snapshot().replaced)."
+            lastStatsFrames = received; lastStatistics = Date()
+        }
         if frameCount == 1 {
             updateFreezeButton()
             setStatus("Livebild empfangen")
-            lamp.isEnabled = true
+            queryLamp()
         }
         applyImageTransform()
     }
@@ -403,12 +430,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
 
     private func resetFreeze() {
         frozen = false
+        preview.setPaused(false)
         updateFreezeButton()
     }
 
     @objc private func toggleFreeze() {
         guard live, latestJPEG != nil else { return }
         frozen.toggle()
+        preview.setPaused(frozen)
         updateFreezeButton()
         frameLabel.stringValue = frozen ? "Standbild" : "Livebild"
         setStatus(frozen ? "Standbild" : "Livebild empfangen")
@@ -423,36 +452,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
 
     }
 
-    @objc private func setLamp() {
-        let choice = lamp.indexOfSelectedItem
-        lamp.selectItem(at: 0)
-        guard live, choice > 0 else { return }
+    private func resetLamp() {
+        awaitingLamp = nil; confirmedLamp = nil; lampQuerySent = false
+        lamp.state = .off; lamp.isEnabled = false; lampStatus.stringValue = "Nicht verbunden"
+        _ = transport.light.take(); _ = usb.light.take()
+    }
+
+    private func queryLamp() {
+        guard !lampQuerySent else { return }
+        lampQuerySent = true
+        sendLamp(nil)
+    }
+
+    @objc private func setLamp() { sendLamp(lamp.state == .on) }
+
+    private func sendLamp(_ on: Bool?) {
+        guard live, awaitingLamp == nil else { return }
         lampID &+= 1
         let id = lampID
-        awaitingLamp = id
-        lamp.isEnabled = false
-        lamp.item(at: 0)?.title = "Licht …"
+        awaitingLamp = id; lamp.isEnabled = false
+        lampStatus.stringValue = on == nil ? "Zustand wird gelesen …" : "Wird geschaltet …"
         let channel = bridgePath == nil ? transport.light : usb.light
-        channel.submit(id: id, on: choice == 1)
+        channel.submit(id: id, on: on)
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
             guard let self, self.awaitingLamp == id else { return }
             self.awaitingLamp = nil
+            self.lamp.state = self.confirmedLamp == true ? .on : .off
             self.lamp.isEnabled = self.live
-            self.lamp.item(at: 0)?.title = "Licht unbestätigt"
+            self.lampStatus.stringValue = "Zustand unbestätigt"
         }
     }
 
     private func receiveLampReply(_ data: Data) {
         guard data.count >= 15, data.prefix(4) == Data([0xee,0xff,0xee,0xff]),
-              data[6] == 10, data[7] == 0, data[9] == 0, data[10] >= 3,
+              data[6] == 10, data[7] == 0, data[9] == 0, data[10] >= 3, data[13] <= 1,
               awaitingLamp == UInt16(data[4]) | (UInt16(data[5]) << 8) else { return }
         awaitingLamp = nil
-        lamp.item(at: 0)?.title = data[13] == 0 ? "Licht aus" : "Licht an"
+        confirmedLamp = data[13] == 1
+        lamp.state = confirmedLamp == true ? .on : .off
+        lampStatus.stringValue = confirmedLamp == true ? "Licht an" : "Licht aus"
         lamp.isEnabled = live
     }
 
     private func refreshSources() {
-        guard !checkingFirmware, !flashing, !live, !connectRequested else { return }
+        guard !checkingFirmware, !flashing, !live, !connectRequested, !reconnect.wanted else { return }
         let ports = ((try? FileManager.default.contentsOfDirectory(atPath: "/dev")) ?? [])
             .filter { $0.hasPrefix("cu.usbmodem") }.sorted()
         let titles = ["Kamera-WLAN"] + ports.map { "USB · " + $0 }
@@ -473,6 +516,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
 
     @objc private func sourceChanged() {
         preferredSource = source.titleOfSelectedItem
+        UserDefaults.standard.set(preferredSource, forKey: "PreferredSource")
         updateSourceStatus()
     }
 
@@ -539,7 +583,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
 
     @objc private func installFirmware() {
         guard !flashing, !checkingFirmware else { return }
-        guard !live, !connectRequested else {
+        guard !live, !connectRequested, !reconnect.wanted else {
             setStatus("Bitte zuerst das Livebild stoppen.")
             return
         }
@@ -549,7 +593,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         }
         let alert = NSAlert()
         alert.messageText = "Firmware auf das C3 SuperMini schreiben?"
-        alert.informativeText = "Das Programm auf dem Board an \(port) wird durch die Kamerabrücke für Soulear-79144 ersetzt. Lass das USB-Kabel bis zum Abschluss eingesteckt."
+        alert.informativeText = "Das Programm auf dem Board an \(port) wird durch die Kamerabrücke für das ausgewählte Kameraprofil ersetzt. Lass das USB-Kabel bis zum Abschluss eingesteckt."
         alert.addButton(withTitle: "Abbrechen")
         alert.addButton(withTitle: "Installieren")
         guard alert.runModal() == .alertSecondButtonReturn else { return }
@@ -585,39 +629,90 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     }
 
     @objc private func toggleLive() {
+        if reconnect.wanted || live || connectRequested {
+            reconnect.stop(); connectRequested = false
+            if live {
+                startButton.isEnabled = false
+                if retryUSB { usb.stop() } else { transport.stop() }
+            } else {
+                startButton.title = "Verbinden"
+                source.isEnabled = true; profilePicker.isEnabled = true; profileButton.isEnabled = true
+                setStatus("Verbindung beendet")
+            }
+            return
+        }
+        guard !checkingFirmware, !flashing else { return }
+        preferredSource = source.titleOfSelectedItem
+        UserDefaults.standard.set(preferredSource, forKey: "PreferredSource")
+        retryUSB = bridgePath != nil; retryPort = bridgePath
+        reconnect.start()
+        attemptConnection()
+    }
+
+    private func attemptConnection() {
+        guard reconnect.wanted, !live, !probing, !checkingFirmware, !flashing else { return }
+        source.isEnabled = false; profilePicker.isEnabled = false; profileButton.isEnabled = false
+        startButton.title = "Verbindung beenden"; startButton.isEnabled = true
+        if retryUSB {
+            var path = retryPort
+            if path == nil || !FileManager.default.fileExists(atPath: path!) {
+                let ports = ((try? FileManager.default.contentsOfDirectory(atPath: "/dev")) ?? [])
+                    .filter { $0.hasPrefix("cu.usbmodem") }.map { "/dev/" + $0 }.filter { Self.isEspressifUSB($0) }
+                if ports.count == 1 { path = ports[0] } else {
+                    reconnect.failed(); setStatus("Warte auf den C3 am USB-Anschluss …"); return
+                }
+            }
+            guard let path else { return }
+            retryPort = path
+            if bridgePath != path {
+                source.addItem(withTitle: "USB · " + URL(fileURLWithPath: path).lastPathComponent)
+                source.lastItem?.representedObject = path
+                source.selectItem(at: source.numberOfItems - 1)
+            }
+            prepareStream()
+            setStatus("Verbinde C3 mit \(profile.ssid) …")
+            usb.start(path, profile: profile)
+        } else {
+            connectRequested = true
+            discover()
+        }
+    }
+
+    private func prepareStream() {
+        preview.reset(); resetLamp(); latestJPEG = nil; captureButton.isEnabled = false
+        imageView.image = nil; placeholder.stringValue = "Warte auf Kamerabild …"; placeholder.isHidden = false
+        frameCount = 0; lastStatistics = .distantPast; lastStatsFrames = 0; sensorAngle = nil
+        live = true; resetFreeze()
+    }
+
+    private func connectionTick() {
         if live {
-            if bridgePath != nil { usb.stop() } else { transport.stop() }
+            let last = preview.snapshot().lastReceived
+            if last > 0 && ProcessInfo.processInfo.systemUptime - last > 3 {
+                placeholder.stringValue = "Kein aktuelles Kamerabild …"; placeholder.isHidden = false
+                lamp.isEnabled = false; captureButton.isEnabled = false
+                setStatus("Kamera antwortet nicht. Verbindung wird geprüft …")
+            } else if last > 0 {
+                if frozen { placeholder.isHidden = true }
+                captureButton.isEnabled = latestJPEG != nil
+                lamp.isEnabled = awaitingLamp == nil
+            }
             return
         }
-        if let path = bridgePath {
-            live = true
-            source.isEnabled = false
-            sensorAngle = nil
-            latestJPEG = nil
-            captureButton.isEnabled = false
-            imageView.image = nil
-            placeholder.isHidden = false
-            frameCount = 0
-            startButton.title = "Livebild stoppen"
-            setStatus("Warte auf Kamera über USB …")
-            usb.start(path)
-            return
-        }
-        source.isEnabled = false
-        connectRequested = true
-        startButton.isEnabled = false
-        discover()
+        if reconnect.due() { attemptConnection() }
+        else if !reconnect.wanted { refreshSources() }
     }
 
     private func discover() {
         guard !flashing, bridgePath == nil, !live, !probing else { return }
         probing = true
+        let selectedProfile = profile
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let result = CameraDiscovery.lookup()
+            let result = CameraDiscovery.lookup(profile: selectedProfile)
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.probing = false
-                guard self.bridgePath == nil, !self.live else { self.connectRequested = false; return }
+                guard self.profile == selectedProfile, self.bridgePath == nil, !self.live else { self.connectRequested = false; return }
                 self.ipField.stringValue = result.host ?? "—"
                 self.setStatus(result.message)
                 self.startButton.isEnabled = true
@@ -626,30 +721,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
                     self.sensorAngle = nil
                     self.beginStream(host)
                 }
+                if self.connectRequested && result.host == nil { self.reconnect.failed() }
                 self.connectRequested = false
-                self.source.isEnabled = !self.live
+                self.source.isEnabled = !self.live && !self.reconnect.wanted
             }
         }
     }
 
     private func beginStream(_ address: String) {
-        latestJPEG = nil
-        captureButton.isEnabled = false
-        imageView.image = nil
-        placeholder.isHidden = false
-        frameCount = 0
+        prepareStream()
         frameLabel.stringValue = "UDP · \(address)"
-        live = true
         startButton.title = "Livebild stoppen"
         ipField.isEnabled = false
         setStatus("Verbinde mit \(address) …")
         transport.start(host: address, videoPort: 22789)
     }
 
-    @objc private func updateOrientation() { applyImageTransform() }
+    @objc private func updateOrientation() { applyImageTransform(); saveViewSettings() }
     @objc private func toggleFullscreen() { window.toggleFullScreen(nil) }
-    @objc private func rotateImage() { rotation += .pi / 2; applyImageTransform() }
-    @objc private func mirrorImage() { mirrored.toggle(); applyImageTransform() }
+    @objc private func rotateImage() { rotation = (rotation + .pi / 2).truncatingRemainder(dividingBy: .pi * 2); applyImageTransform(); saveViewSettings() }
+    @objc private func mirrorImage() { mirrored.toggle(); applyImageTransform(); saveViewSettings() }
     private func updateZoom() {
         scaleLabel.stringValue = String(format: "%.2g×", zoom)
         applyImageTransform()
@@ -659,9 +750,94 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         imageView.adjustOffset(from: zoom, to: next, at: point)
         zoom = next
         updateZoom()
+        saveViewSettings()
     }
     @objc private func zoomIn() { changeZoom((zoom + 0.25) / zoom, at: imageView.centerPoint) }
     @objc private func zoomOut() { changeZoom((zoom - 0.25) / zoom, at: imageView.centerPoint) }
+
+    private func restoreSettings() {
+        let defaults = UserDefaults.standard
+        if let data = defaults.data(forKey: "CameraProfiles"), let saved = try? JSONDecoder().decode([CameraProfile].self, from: data) {
+            let valid = saved.filter { $0.isValid }
+            if !valid.isEmpty { profiles = valid }
+        }
+        profileIndex = profiles.firstIndex { $0.id == defaults.string(forKey: "SelectedProfile") } ?? 0
+        preferredSource = defaults.string(forKey: "PreferredSource")
+        refreshProfilePicker()
+        loadViewSettings()
+    }
+
+    private func refreshProfilePicker() {
+        profilePicker.removeAllItems()
+        profilePicker.addItems(withTitles: profiles.map(\.name))
+        profilePicker.selectItem(at: profileIndex)
+    }
+
+    private func saveProfiles() {
+        if let data = try? JSONEncoder().encode(profiles) { UserDefaults.standard.set(data, forKey: "CameraProfiles") }
+        UserDefaults.standard.set(profile.id, forKey: "SelectedProfile")
+    }
+
+    private func saveViewSettings() {
+        let settings = ViewSettings(zoom: Double(zoom), rotation: Double(rotation), mirrored: mirrored,
+            automatic: automatic.state == .on, offsetX: Double(imageView.offset.x), offsetY: Double(imageView.offset.y))
+        if let data = try? JSONEncoder().encode(settings) { UserDefaults.standard.set(data, forKey: "View." + profile.id) }
+    }
+
+    private func loadViewSettings() {
+        var settings = UserDefaults.standard.data(forKey: "View." + profile.id)
+            .flatMap { try? JSONDecoder().decode(ViewSettings.self, from: $0) } ?? ViewSettings()
+        settings.sanitize()
+        zoom = CGFloat(settings.zoom); rotation = CGFloat(settings.rotation); mirrored = settings.mirrored
+        automatic.state = settings.automatic ? .on : .off
+        imageView.offset = NSPoint(x: settings.offsetX, y: settings.offsetY)
+        updateZoom()
+    }
+
+    @objc private func profileChanged() {
+        guard !live, !reconnect.wanted, !checkingFirmware, !flashing else { refreshProfilePicker(); return }
+        saveViewSettings()
+        profileIndex = profilePicker.indexOfSelectedItem
+        saveProfiles(); loadViewSettings(); discover()
+    }
+
+    @objc private func editProfile() {
+        guard !live, !reconnect.wanted, !checkingFirmware, !flashing else { return }
+        let alert = NSAlert()
+        alert.messageText = "Kameraprofil"
+        alert.informativeText = "Für Kameras mit kompatiblem Soulear/i4season-Protokoll und offenem WLAN. Andere Protokolle werden noch nicht unterstützt. Im USB-Betrieb wird das Profil beim Verbinden an den C3 übertragen."
+        let fields = [NSTextField(string: profile.name), NSTextField(string: profile.ssid), NSTextField(string: profile.host)]
+        let view = NSView(frame: NSRect(x: 0, y: 0, width: 380, height: 150))
+        for (i, label) in ["Name", "Kamera-WLAN (SSID)", "Kamera-IP"].enumerated() {
+            let caption = NSTextField(labelWithString: label)
+            caption.frame = NSRect(x: 0, y: 128 - i*50, width: 380, height: 18)
+            fields[i].frame = NSRect(x: 0, y: 104 - i*50, width: 380, height: 24)
+            view.addSubview(caption); view.addSubview(fields[i])
+        }
+        alert.accessoryView = view
+        alert.addButton(withTitle: "Speichern")
+        alert.addButton(withTitle: "Als neues Profil")
+        alert.addButton(withTitle: "Abbrechen")
+        if profiles.count > 1 { alert.addButton(withTitle: "Löschen") }
+        alert.window.initialFirstResponder = fields[0]
+        let response = alert.runModal()
+        guard response != .alertThirdButtonReturn else { return }
+        if response.rawValue == NSApplication.ModalResponse.alertFirstButtonReturn.rawValue + 3 {
+            profiles.remove(at: profileIndex); profileIndex = 0
+        } else {
+            var edited = CameraProfile(id: profile.id, name: fields[0].stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
+                ssid: fields[1].stringValue, host: fields[2].stringValue.trimmingCharacters(in: .whitespacesAndNewlines))
+            guard edited.isValid else {
+                let error = NSAlert(); error.messageText = "Profil bitte prüfen"
+                error.informativeText = "Name: 1–60 Zeichen. WLAN-Name: 1–32 UTF-8-Bytes. Kamera-IP: gültige IPv4-Adresse."
+                error.runModal(); return
+            }
+            if response == .alertSecondButtonReturn {
+                edited.id = UUID().uuidString; profiles.append(edited); profileIndex = profiles.count - 1
+            } else { profiles[profileIndex] = edited }
+        }
+        saveProfiles(); refreshProfilePicker(); loadViewSettings(); discover()
+    }
 
     @objc private func savePhoto() {
         guard let latestJPEG else { return }
@@ -716,7 +892,7 @@ private final class CameraTransport {
     private func receive(host: String, videoPort: UInt16) {
         let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
         guard fd >= 0 else { onStopped?("UDP-Socket konnte nicht geöffnet werden."); return }
-        var timeout = timeval(tv_sec: 1, tv_usec: 0)
+        var timeout = timeval(tv_sec: 0, tv_usec: 100_000)
         _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
 
         var local = sockaddr_in()
@@ -789,7 +965,7 @@ private final class CameraTransport {
                 let packet = Data(buffer[0..<count])
                 if packet.first == 1 || packet.first == 6 { sawVideo = true }; if let jpeg = assembler.append(packet) { lastFrame = Date(); onFrame?(jpeg, assembler.completedRoll) }
             }
-            if Date().timeIntervalSince(lastFrame) > 12 {
+            if Date().timeIntervalSince(lastFrame) > 8 {
                 Darwin.close(fd)
                 onStopped?(sawVideo ? "Kamera sendet Daten, aber kein vollständiges Bild." : "Kamera erkannt, aber kein Videobild. Handy-App schließen und erneut verbinden.")
                 return
@@ -819,81 +995,26 @@ private final class CameraTransport {
     }
 }
 
-private struct FrameAssembler {
-    private(set) var completedRoll: CGFloat?
-    private var pendingRoll: CGFloat?
-    private var frameID: UInt8?
-    private var firstChunk: UInt8?
-    private var expectedChunks = 0
-    private var pieces: [UInt8: Data] = [:]
-
-    mutating func append(_ packet: Data) -> Data? {
-        let bytes = [UInt8](packet)
-        let header = bytes.first == 6 ? 28 : 16
-        guard bytes.count > header, bytes[0] == 1 || bytes[0] == 6 else { return nil }
-        let incomingFrame = bytes[2]
-        if let frameID, frameID != incomingFrame { reset() }
-        if frameID == nil {
-            frameID = incomingFrame
-            firstChunk = bytes[1]
-            expectedChunks = Int(bytes[4])
-        }
-        if expectedChunks == 0 { expectedChunks = Int(bytes[4]) }
-        if bytes[5] & 1 != 0 {
-            let sample = bytes[6..<10].reversed().reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
-            func component(_ shift: Int) -> CGFloat {
-                let field = (sample >> shift) & 1023
-                return CGFloat(field & 511) * (field & 512 == 0 ? 1 : -1)
-            }
-            let y = component(10), z = component(0)
-            if hypot(y, z) >= 20 { pendingRoll = atan2(y, z) }
-        }
-        if bytes.count >= header + 2 && bytes[header] == 0xff && bytes[header + 1] == 0xd8 {
-            firstChunk = bytes[1]
-        }
-        pieces[bytes[1]] = Data(bytes[header...])
-        guard expectedChunks > 0, expectedChunks < 256, pieces.count >= expectedChunks else { return nil }
-        guard let firstChunk else { return nil }
-        var jpeg = Data()
-        jpeg.reserveCapacity(expectedChunks * 1400)
-        for offset in 0..<expectedChunks {
-            guard let fragment = pieces[firstChunk &+ UInt8(offset)] else { return nil }
-            jpeg.append(fragment)
-        }
-        completedRoll = pendingRoll
-        reset()
-        guard jpeg.starts(with: [0xff, 0xd8]), let end = jpeg.range(of: Data([0xff, 0xd9]), options: .backwards) else { return nil }
-        return Data(jpeg.prefix(end.upperBound))
-    }
-
-    private mutating func reset() {
-        frameID = nil
-        pendingRoll = nil
-        firstChunk = nil
-        expectedChunks = 0
-        pieces.removeAll(keepingCapacity: true)
-    }
-}
-
 private enum CameraDiscovery {
-    static func lookup() -> (host: String?, message: String, inverted: Bool) {
+    static func lookup(profile: CameraProfile) -> (host: String?, message: String, inverted: Bool) {
         guard let wifi = CWWiFiClient.shared().interface(), let name = wifi.interfaceName,
               let store = SCDynamicStoreCreate(nil, "Soulear Lupe" as CFString, nil, nil),
               let services = SCDynamicStoreCopyMultiple(store, nil, ["State:/Network/Service/.*/IPv4"] as CFArray) as? [String: [String: Any]],
               let service = services.values.first(where: { ($0["InterfaceName"] as? String) == name }),
               let local = (service["Addresses"] as? [String])?.first else {
-            return (nil, "Mac mit dem WLAN Soulear-79144 verbinden.", false)
+            return (nil, "Mac mit dem WLAN \(profile.ssid) verbinden.", false)
         }
         let ssid = wifi.ssid() ?? ""
-        let bridgeHint = "Für USB das SuperMini anschließen und USB auswählen. Für Direktbetrieb Soulear-79144 wählen."
-        if !ssid.isEmpty && !ssid.lowercased().hasPrefix("soulear-") {
+        let bridgeHint = "Für USB das SuperMini anschließen und USB auswählen. Für Direktbetrieb \(profile.ssid) wählen."
+        if !ssid.isEmpty && ssid != profile.ssid {
             return (nil, bridgeHint, false)
         }
-        guard let host = service["Router"] as? String else {
+        guard let gateway = service["Router"] as? String else {
             return (nil, "Das WLAN hat noch keine Router-Adresse zugewiesen.", false)
         }
         // macOS can withhold the SSID. Only probe the known camera gateway in that case.
-        if ssid.isEmpty && host != "192.168.1.1" { return (nil, bridgeHint, false) }
+        if ssid.isEmpty && gateway != profile.host { return (nil, bridgeHint, false) }
+        let host = profile.host
         let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
         guard fd >= 0 else { return (nil, "Netzwerkzugriff fehlgeschlagen.", false) }
         defer { Darwin.close(fd) }
@@ -938,7 +1059,7 @@ private final class LevelImageView: NSView {
     var verticalScale: CGFloat = 1
 
     var onZoom: ((CGFloat, NSPoint) -> Void)?
-    private var offset = NSPoint.zero // In fractions of the aperture diameter
+    var offset = NSPoint.zero // In fractions of the aperture diameter
     var centerPoint: NSPoint { NSPoint(x: bounds.midX, y: bounds.midY) }
     private var diameter: CGFloat {
         guard let image, image.size.width > 0, image.size.height > 0 else { return 0 }
@@ -1008,101 +1129,6 @@ private final class LevelImageView: NSView {
         transform.translateX(by: -bounds.midX, yBy: -bounds.midY)
         transform.concat()
         image.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
-    }
-}
-
-private final class BridgeReader {
-    let light = LampChannel()
-    var onFrame: ((Data, CGFloat?, Bool) -> Void)?
-    var onStopped: ((String) -> Void)?
-    private let lock = NSLock()
-    private var stopped = true
-
-    func stop() {
-        lock.lock(); stopped = true; lock.unlock()
-    }
-    private var active: Bool {
-        lock.lock(); defer { lock.unlock() }; return !stopped
-    }
-    func start(_ path: String) {
-        lock.lock(); stopped = false; lock.unlock()
-        DispatchQueue.global(qos: .userInitiated).async {
-            let message = self.receive(path)
-            self.onStopped?(message)
-        }
-    }
-    private func receive(_ path: String) -> String {
-        let fd = open(path, O_RDWR | O_NOCTTY | O_NONBLOCK)
-        guard fd >= 0 else { return "USB-Anschluss lässt sich nicht öffnen." }
-        defer { Darwin.close(fd) }
-        var tty = termios()
-        guard tcgetattr(fd, &tty) == 0 else { return "USB-Anschluss nicht verfügbar." }
-        let original = tty
-        defer { var restore = original; tcsetattr(fd, TCSANOW, &restore) }
-        cfmakeraw(&tty)
-        tty.c_cflag |= tcflag_t(CLOCAL | CREAD)
-        cfsetspeed(&tty, speed_t(B115200))
-        guard tcsetattr(fd, TCSANOW, &tty) == 0 else { return "USB-Konfiguration fehlgeschlagen." }
-        tcflush(fd, TCIFLUSH) // Discard frames buffered before this live session.
-        let magic = Data("LPV1".utf8)
-        var pending = Data(), assembler = FrameAssembler()
-        var input = [UInt8](repeating: 0, count: 8192)
-        var last = Date()
-        while active {
-            if let command = light.take() {
-                _ = command.withUnsafeBytes { Darwin.write(fd, $0.baseAddress, $0.count) }
-            }
-            if Date().timeIntervalSince(last) > 25 { return "Kein Bild über USB. Brückenfirmware und Kamera-Stromversorgung prüfen." }
-            var event = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
-            let ready = poll(&event, 1, 200)
-            if ready < 0 && errno == EINTR { continue }
-            if ready < 0 || event.revents & Int16(POLLHUP | POLLERR | POLLNVAL) != 0 { return "USB-Verbindung getrennt." }
-            if ready == 0 { continue }
-            let n = input.withUnsafeMutableBytes { Darwin.read(fd, $0.baseAddress, $0.count) }
-            if n < 0 && (errno == EAGAIN || errno == EINTR) { continue }
-            guard n > 0 else { return "USB-Verbindung getrennt." }
-            pending.append(contentsOf: input.prefix(n))
-            while let marker = pending.range(of: magic) {
-                pending.removeSubrange(pending.startIndex..<marker.lowerBound)
-                let start = pending.startIndex
-                guard pending.count >= 7 else { break }
-                let length = Int(pending[start+4]) + 256 * Int(pending[start+5])
-                guard length == 15 || (17...2048).contains(length) else { pending.removeFirst(); continue }
-                guard pending.count >= 7 + length else { break }
-                let inverted = pending[start+6] != 0
-                let packet = Data(pending[(start+7)..<(start+7+length)])
-                pending.removeFirst(7+length)
-                if length == 15 { light.reply?(packet); continue }
-                if let jpeg = assembler.append(packet) {
-                    last = Date()
-                    onFrame?(jpeg, assembler.completedRoll, inverted)
-                }
-            }
-            if pending.range(of: magic) == nil { pending = Data(pending.suffix(3)) }
-        }
-        return "Livebild gestoppt"
-    }
-}
-
-private final class LampChannel {
-    var reply: ((Data) -> Void)?
-    private let lock = NSLock()
-    private var pending: Data?
-
-    func submit(id: UInt16, on: Bool) {
-        let packet = Data([0xee,0xff,0xee,0xff,UInt8(truncatingIfNeeded: id),UInt8(id >> 8),
-                           10,0,1,0,3,0,0x11,on ? 1 : 0,on ? 100 : 0])
-        lock.lock()
-        pending = packet
-        lock.unlock()
-    }
-
-    func take() -> Data? {
-        lock.lock()
-        defer { lock.unlock() }
-        let packet = pending
-        pending = nil
-        return packet
     }
 }
 

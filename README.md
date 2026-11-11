@@ -17,7 +17,11 @@ MR-Linse zeigt das Livebild einer kompatiblen Soulear-WLAN-Kamera in einer nativ
 - **Drehen und Spiegeln** für den passenden Blickwinkel.
 - **Standbild per Leertaste** und Vollbildmodus.
 - **JPEG-Fotos** als aktuelle Ansicht oder unverändertes Kameraoriginal.
-- **Kameralicht ein- und ausschalten**, mit Rückmeldung der Kamera.
+- **Nativer Lichtschalter**, mit Abfrage und Rückmeldung der Kamera.
+- **Automatische Wiederverbindung** nach Kamera- oder USB-Ausfall; bewusstes Stoppen beendet weitere Versuche.
+- **Kameraprofile** mit einstellbarem WLAN-Namen und Kamera-IP.
+- **Gespeicherte Optik-Einstellungen je Profil**: Zoom, Bildausschnitt, Spiegelung, Drehung und automatische Ausrichtung.
+- **JPEG-Verarbeitung im Hintergrund**, mit begrenztem Bildpuffer und Anzeige der lokalen Verarbeitungszeit.
 - **C3-Firmware direkt aus der App installieren und prüfen.** Bei passender Firmware verschwindet die Installationsschaltfläche.
 
 ## Voraussetzungen und aktueller Stand
@@ -31,11 +35,13 @@ MR-Linse zeigt das Livebild einer kompatiblen Soulear-WLAN-Kamera in einer nativ
 | GitHub-Paket | macOS ARM64, einschließlich ARM64-esptool und C3-Firmware |
 | Windows / Linux | Noch nicht verfügbar; benötigen eine Portierung |
 
-Andere Kameramodelle und Protokollvarianten sind nicht pauschal bestätigt. Die mitgelieferte C3-Firmware verbindet sich fest mit **`Soulear-79144`**. Für einen anderen WLAN-Namen muss `cameraSSID` in [main.cpp](SoulearLupe/C3-Bruecke/src/main.cpp) angepasst und die Firmware neu gebaut werden.
+Andere Kameramodelle und Protokollvarianten sind nicht pauschal bestätigt. Unter **Kamera → Profil bearbeiten …** lassen sich Name, WLAN-Name und Kamera-IP speichern; **Als neues Profil** legt ein weiteres Profil an. Unterstützt sind weiterhin nur kompatible Soulear/i4season-Kameras mit offenem WLAN, keine beliebigen IP-Kameras.
+
+**Für Version 0.3.0 einmalig die neue C3-Firmware über die App installieren.** Danach wird das Profil beim Verbinden über USB übertragen und auf dem C3 gespeichert. Ein neuer WLAN-Name erfordert kein erneutes Kompilieren mehr. Die App beginnt erst nach Bestätigung des Profils mit der Bildanzeige.
 
 ## Herunterladen und öffnen
 
-Nach einem erfolgreichen GitHub-Build gibt es unter **Actions → Build MR-Linse → Artifacts** ein Paket mit der App und der separaten C3-Firmware. Bei einem veröffentlichten GitHub-Release werden diese Downloads automatisch angehängt.
+Nach einem erfolgreichen GitHub-Build gibt es unter **Actions → Build MR-Linse → Artifacts** ein Paket mit der App und der separaten C3-Firmware. Bei einer neuen Versionsnummer erstellt der erfolgreiche Push-Build automatisch ein Release mit den Downloads.
 
 1. `MR-Linse-macOS-arm64.zip` herunterladen und entpacken.
 2. `MR-Linse.app` in den Ordner **Programme** ziehen und öffnen.
@@ -75,22 +81,26 @@ Die Kamera ist normalerweise unter **192.168.1.1** erreichbar. Die Adresse des H
 | --- | --- |
 | Zoom | Plus/Minus, Scrollen oder Trackpad-Vergrößerungsgeste; 1× bis 4× |
 | Ausrichtung | **Auto-Drehung**, manuell in 90°-Schritten drehen oder horizontal spiegeln |
-| Licht | Menü **Kameralicht → Licht einschalten / Licht ausschalten** |
+| Licht | Schiebeschalter **Kameralicht**; darunter steht der bestätigte Zustand |
 | Standbild | Pause-Schaltfläche oder **Leertaste**; erneut drücken setzt das Livebild fort |
 | Foto | Kamera-Symbol; **Aktuelle Ansicht** oder **Kameraoriginal** im Speicherdialog |
 | Vollbild | Vollbild-Schaltfläche in der Werkzeugleiste |
-| Verbindung beenden | **Livebild stoppen** |
+| Verbindung beenden | **Livebild stoppen** bzw. **Verbindung beenden** |
 
 **Aktuelle Ansicht** speichert Zoom, Drehung, Spiegelung und den runden Ausschnitt in einem quadratischen JPEG; außerhalb des Kreises ist das Bild schwarz. **Kameraoriginal** speichert das unveränderte JPEG der Kamera. Beide Varianten beziehen sich auf den Moment, in dem der Speicherdialog geöffnet wurde.
 
-Die automatische Ausrichtung benötigt passende Sensordaten der Kamera. Das Lichtmenü ist nach dem ersten Kamerabild verfügbar; **Licht unbestätigt** bedeutet, dass keine Bestätigung eingetroffen ist.
+Die automatische Ausrichtung benötigt passende Sensordaten der Kamera. Nach dem ersten Bild fragt die App den Lichtzustand ab. **Zustand unbestätigt** bedeutet, dass keine Bestätigung eingetroffen ist; die App behauptet dann keinen neuen bestätigten Zustand.
+
+Nach einem Verbindungsverlust versucht die App es mit zunehmendem Abstand (bis 15 Sekunden) erneut. Ein Klick auf **Verbindung beenden** beendet diese Versuche. Bei einem geänderten USB-Port wird nur ein eindeutig einzelnes erkanntes Espressif-Gerät automatisch gewählt; bei mehreren Geräten den richtigen Anschluss manuell auswählen.
+
+Die Anzeige **Verarbeitung … ms** misst ab dem vollständigen JPEG-Empfang am Mac bis zur Übergabe an die Ansicht. Das ist **nicht** die gesamte Verzögerung von Kamerasensor, WLAN und Bildschirm. Ob die Übertragung am echten Gerät spürbar schneller ist, muss mit der Kamera geprüft werden.
 
 ## Wenn etwas nicht funktioniert
 
 | Problem | Zuerst prüfen |
 | --- | --- |
 | Kein USB-Anschluss sichtbar | Datenfähiges Kabel verwenden, neu einstecken, andere Programme am seriellen Port schließen |
-| USB verbunden, aber kein Bild | Kamera eingeschaltet? WLAN-Name `Soulear-79144`? Handy-App geschlossen? |
+| USB verbunden, aber kein Bild | Kamera eingeschaltet? WLAN-Name im gewählten Profil korrekt? Handy-App geschlossen? |
 | Keine Antwort im direkten WLAN-Modus | Mac im Kamera-WLAN? Quelle **Kamera-WLAN** gewählt? Lokaler Netzwerkzugriff erlaubt? |
 | Firmware lässt sich nicht installieren | Richtigen Anschluss wählen; bei Bedarf **BOOT** halten, **RESET** kurz drücken, **BOOT** loslassen, Anschluss erneut auswählen |
 | Bild steht still | Standbild aktiv? Leertaste drücken; bei Funkproblemen Abstand verringern und neu verbinden |
@@ -107,10 +117,11 @@ GitHub-Builds übernehmen das Repository automatisch. Für lokale Builds kann es
 
 Für eine Veröffentlichung:
 
-1. Version in `SoulearLupe/VERSION` erhöhen, zum Beispiel auf `0.3.0`.
-2. Änderungen committen und pushen.
-3. Ein Release mit dem passenden Tag `v0.3.0` und Änderungsnotizen veröffentlichen.
-4. Den erfolgreichen GitHub-Build abwarten. Erst mit dem fertigen Mac-ZIP wird die neue Version zum Download angeboten.
+1. Version in `SoulearLupe/VERSION` erhöhen, beim nächsten Mal beispielsweise auf `0.3.1`.
+2. Änderungsnotizen in `RELEASE_NOTES.md` aktualisieren.
+3. Änderungen committen und auf `main` pushen.
+
+GitHub erstellt nach erfolgreichem Build automatisch den passenden Tag und das Release mit App, Firmware und PDF. **Keine Tags oder Releases mehr von Hand anlegen.** Bereits vollständig veröffentlichte Versionen bleiben unverändert. Ein fehlgeschlagener Upload kann mit demselben Commit erneut gestartet werden. Pull Requests veröffentlichen nichts.
 
 Neue Kameramodelle können später mit einer App-Version und bei Bedarf einer angepassten C3-Firmware ausgeliefert werden. Die Updatefunktion erweitert noch nicht die derzeitige Kamerakompatibilität.
 
@@ -128,7 +139,7 @@ zsh SoulearLupe/build_app.sh
 
 Das Ergebnis ist **`MR-Linse.app`** in der Repository-Wurzel. `swift build` allein baut nur das Programm; `build_app.sh` verpackt zusätzlich Icon, Flash-Tool und Firmware.
 
-Der [GitHub-Workflow](.github/workflows/build.yml) startet bei Push auf `main`/`master`, bei Pull Requests, manuell und bei veröffentlichten Releases. Er prüft Build, Firmwaredateien, Flash-Tool und Bundle-Signatur. Kamerabild, Übertragung und Flashen benötigen zusätzlich einen Test an echter Hardware.
+Der [GitHub-Workflow](.github/workflows/build.yml) startet bei Push auf `main`/`master`, bei Pull Requests und manuell. Nur Builds auf `main`/`master` veröffentlichen automatisch. Er prüft Build, Firmwaredateien, Flash-Tool und Bundle-Signatur. Kamerabild, Übertragung und Flashen benötigen zusätzlich einen Test an echter Hardware.
 
 ## Projektstruktur
 

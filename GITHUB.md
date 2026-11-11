@@ -1,57 +1,31 @@
-# MR-Linse auf GitHub bauen
+# MR-Linse automatisch veröffentlichen
 
-## Was aktuell moeglich ist
+## Aktueller Stand: v0.3.0
 
-Die App verwendet Swift/AppKit sowie CoreWLAN, IOKit und Darwin. Sie ist derzeit eine reine macOS-App. Anders als der JUCE-basierte WarmSix-Editor kann sie nicht unveraendert unter Windows oder Linux gebaut werden. Dafuer ist eine Portierung von Oberflaeche, Netzwerk-/USB-Zugriff und Firmware-Installer notwendig; weitere Runner in einer YAML reichen nicht.
+In GitHub Desktop alle Änderungen committen und **Push origin** klicken. Der Workflow baut, testet und veröffentlicht anschließend automatisch die Mac-App, C3-Firmware und PDF-Anleitung.
 
-Der Workflow baut macOS fuer Apple Silicon (M1 und neuer, macOS 13+), einschliesslich des eingebetteten ARM64-esptool. Intel-Macs sind mit diesem Paket nicht unterstuetzt. Die C3-Firmware wird aus dem Quellcode gebaut und in die App kopiert.
+**Tags und Releases nicht mehr manuell anlegen.** Eine vorhandene vollständig veröffentlichte Version bleibt unverändert. Die App und die C3-Firmware werden niemals durch einen GitHub-Lauf auf lokaler Hardware installiert.
 
-## Upload
+## Spätere Versionen
 
-Den INHALT des Ordners `Lupe` als Repository-Wurzel verwenden:
+1. `SoulearLupe/VERSION` erhöhen, zum Beispiel auf `0.3.1`.
+2. `RELEASE_NOTES.md` aktualisieren.
+3. Commit und Push auf main.
 
-```
-.github/workflows/build.yml
-.gitignore
-GITHUB.md
-README.md
-Docs/MR-Linse-Bedienungsanleitung.pdf
-SoulearLupe/
-  Package.swift
-  build_app.sh
-  Sources/
-  Artwork/
-  FlashResources/
-  C3-Bruecke/platformio.ini
-  C3-Bruecke/src/
-```
+Der Tag wird aus VERSION erzeugt und auf genau den gebauten Commit gesetzt. App, Firmware und PDF müssen vorhanden sein, bevor veröffentlicht wird. Bei einem Uploadfehler denselben Workflow erneut ausführen; ein passender Entwurf wird fortgesetzt. Ein vorhandener Tag auf einem anderen Commit oder ein bereits unvollständig veröffentlichtes Release erfordert eine neue Versionsnummer.
 
-Auch die versteckten Dateien `.github` und `.gitignore` muessen hochgeladen werden. Am einfachsten geht das mit GitHub Desktop und dem Ordner Lupe als lokalem Repository. Vorhandene .app-Pakete, .pio-tools, .pio und .build werden durch .gitignore ausgeschlossen. Quellcode, Icon und FlashResources inklusive esptool und boot_app0.bin muessen enthalten sein.
+## Projekt hochladen
 
-Falls stattdessen SoulearLupe selbst die Repository-Wurzel sein soll: .github, .gitignore, Docs und diese Anleitung dorthin kopieren. Der Workflow erkennt beide Strukturen.
+Die Repository-Wurzel enthält `.github`, `.gitignore`, `Docs`, `SoulearLupe`, `README.md`, `GITHUB.md` und `RELEASE_NOTES.md`. Alle Dateien unter `.github` müssen mit hochgeladen werden. Build-Verzeichnisse, .pio-tools und .app-Dateien sind ausgeschlossen.
 
-## Bauen und herunterladen
+## Kontrolle
 
-- Push auf main/master oder Pull Request: automatischer Build.
-- Manuell: Actions > Build MR-Linse > Run workflow.
-- Nach erfolgreichem Build: unter Artifacts das Paket herunterladen. Es enthaelt MR-Linse-macOS-arm64.zip , MR-Linse-C3-Firmware.zip und die PDF-Bedienungsanleitung.
-- Ein GitHub-Release mit Publish release veroeffentlichen: derselbe Workflow baut den Stand des Release-Tags und haengt beide ZIP-Dateien und die PDF-Bedienungsanleitung an das Release an.
+Unter **Actions → Build MR-Linse** müssen Build und Veröffentlichung grün sein. Danach stehen die ZIP-Dateien und die PDF unter **Releases**. Zusätzlich gibt es den Build als Artifact. Pull Requests bauen nur. Manuelle Ausführung ist möglich; automatische Veröffentlichung nur auf main/master.
 
-Die Firmware steckt schon in der Mac-App. Ein GitHub-Build flasht keine angeschlossene Hardware.
+Der Workflow prüft Versionslogik, Profilvalidierung, Einstellungen, Wiederverbindung, Lichtpakete, USB-Konfiguration über einen simulierten seriellen Anschluss, Bildpuffer und Release-Verhalten. Tests an echter Kamera bleiben notwendig.
 
-## Signatur und Pruefung
+Das Paket unterstützt macOS 13+ auf Apple Silicon. Windows/Linux benötigen eine Portierung. Die App ist ad-hoc signiert, aber nicht Apple-notarisiert. Für Updateabfragen muss das Release öffentlich erreichbar sein. Repository-/Organisationsregeln müssen Schreibzugriff für den Release-Job erlauben.
 
-Die App wird ad-hoc signiert, aber nicht mit einem Apple-Developer-Zertifikat signiert oder notarisiert. macOS kann daher beim Start einer heruntergeladenen App eine Freigabe in Systemeinstellungen > Datenschutz & Sicherheit verlangen.
+## C3-Firmware
 
-CI prueft den Build, die eingebetteten Firmwaredateien, den Start des Flash-Tools und die Bundle-Signatur. Kamera, USB-Uebertragung und Firmware-Flash muessen weiterhin an echter Hardware getestet werden. Ein erfolgreicher Cloud-Lauf ist erst nach dem Upload in GitHub Actions bestaetigt.
-
-## Versionen und Updatequelle
-
-`SoulearLupe/VERSION` enthält die App-Version. Release-Tags müssen exakt `v` plus diese Version sein (z. B. `v0.2.2`). Der Workflow prüft diese Übereinstimmung und trägt `GITHUB_REPOSITORY` als Updatequelle in die App ein. Die App prüft öffentliche stabile Releases und bietet nur das fertige Paket `MR-Linse-macOS-arm64.zip` an. Vorabversionen sind ausgeschlossen. Details zur Bedienung stehen in der README.
-
-## Veröffentlichung v0.2.2
-
-1. Den vorbereiteten Commit auf main pushen.
-2. Auf GitHub in SoulearLupe/VERSION prüfen: 0.2.2.
-3. Ein neues Release mit dem NEUEN Tag v0.2.2 auf main veröffentlichen.
-4. Den erfolgreichen Build abwarten. Alte fehlgeschlagene Releases müssen nicht erneut gestartet werden.
+Mit 0.3.0 die mitgelieferte Firmware einmal über die App installieren. WLAN-Name und IP werden anschließend aus dem gewählten Kameraprofil an den C3 übertragen. Andere Kameraprotokolle sind damit noch nicht implementiert.

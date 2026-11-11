@@ -6,8 +6,6 @@ on:
   push:
     branches: [main, master]
   pull_request:
-  release:
-    types: [published]
   workflow_dispatch:
 
 permissions:
@@ -37,17 +35,6 @@ jobs:
           # Bundled esptool is arm64; do not silently build an incompatible app.
           test "$(uname -m)" = arm64
 
-      - name: Release-Version pruefen
-        if: github.event_name == 'release'
-        env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: |
-          VERSION="$(cat "$PROJECT/VERSION")"
-          if [[ "$RELEASE_TAG" != "v$VERSION" ]]; then
-            echo "::error::Tag: $RELEASE_TAG; erwarteter Tag: v$VERSION; Commit: $GITHUB_SHA. VERSION committen und pushen, dann einen neuen Tag auf diesem Commit erstellen."
-            exit 1
-          fi
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -62,6 +49,11 @@ jobs:
         run: |
           swiftc "$PROJECT/Sources/SoulearLupe/UpdateRelease.swift" "$PROJECT/Tests/UpdateChecks.swift" -o "$RUNNER_TEMP/update-checks"
           "$RUNNER_TEMP/update-checks"
+
+      - name: Verbindungs- und Release-Tests
+        run: |
+          bash "$PROJECT/Tests/run_checks.sh"
+          python3 -m unittest discover -s .github/scripts -p 'test_*.py'
 
       - name: Mac-App bauen
         run: |
@@ -108,20 +100,23 @@ jobs:
           retention-days: 30
 
   release:
-    name: Downloads an Release anhaengen
+    name: Release automatisch veroeffentlichen
     needs: mac
-    if: github.event_name == 'release'
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
     runs-on: ubuntu-latest
+    concurrency:
+      group: mr-linse-release
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           name: MR-Linse-macOS-arm64
           path: dist
-      - name: Pakete hochladen
+      - name: Release mit Downloads erstellen
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: gh release upload "$RELEASE_TAG" dist/*.zip dist/*.pdf --clobber
+        run: python3 .github/scripts/publish_release.py
